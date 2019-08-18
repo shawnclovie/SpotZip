@@ -1,2 +1,2 @@
 # SpotZip
-zlib wrapper for file or Data
+Easy zip files to archive or unzip them.

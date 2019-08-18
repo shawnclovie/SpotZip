@@ -15,6 +15,6 @@ let package = Package(
     targets: [
         .target(
             name: "SpotZipArchive",
-            dependencies: []),
+            dependencies: ["Spot"]),
     ]
 )

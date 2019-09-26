@@ -10,7 +10,8 @@ let package = Package(
             targets: ["SpotZipArchive"]),
     ],
     dependencies: [
-		.package(url: "https://github.com/shawnclovie/Spot", from: "1.0.0"),
+		.package(url: "https://github.com/shawnclovie/Spot",
+				 .upToNextMajor(from: "1.0.0")),
     ],
     targets: [
         .target(

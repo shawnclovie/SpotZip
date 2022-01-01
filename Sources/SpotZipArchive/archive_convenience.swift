@@ -12,12 +12,9 @@ extension ZipArchive {
 	///   - level: Indicates the `ZipArchiveLevel` that should be applied. Default is .deflate.
 	///   - progress: A progress object that can be used to track or cancel the zip operation.
 	/// - Throws: Throws an error if the source item does not exist or the destination URL is not writable.
-	public static func zipItem(
-		path: URL, destination: URL,
-		keepParent: Bool = false,
-		level: Level = .deflate,
-		progress: Progress? = nil) throws
-	{
+	public static func zip(path: URL, destination: URL, keepParent: Bool = false,
+						   level: Level = .deflate,
+						   progress: Progress? = nil) throws {
 		let fileManager = FileManager()
 		let isDirectory = try typeForItem(path: path, with: fileManager) == .directory
 		let archive = try ZipArchive(path: destination, mode: .create)
@@ -58,8 +55,8 @@ extension ZipArchive {
 	///   - destination: The file URL that identifies the destination of the unzip operation.
 	///   - progress: A progress object that can be used to track or cancel the unzip operation.
 	/// - Throws: Throws an error if the source item does not exist or the destination URL is not writable.
-	public static func unzipItem(path: URL, destination: URL, progress: Progress? = nil) throws {
-		let archive = try ZipArchive(path: path, mode: .read)
+	public static func unzip(file: URL, destination: URL, progress: Progress? = nil) throws {
+		let archive = try ZipArchive(path: file, mode: .read)
 		// Defer extraction of symlinks until all files & directories have been created.
 		// This is necessary because we can't create links to files that haven't been created yet.
 		let sortedEntries = archive.sorted { (lhs, rhs) -> Bool in

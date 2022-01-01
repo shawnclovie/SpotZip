@@ -1,27 +1,4 @@
-//
-//  ZipArchive.swift
-//  Spot
-//
-//  Created by Shawn Clovie on 7/16/2018.
-//  Copyright © 2018 Shawn Clovie. All rights reserved.
-//
-
 import Foundation
-import Spot
-
-public let ZipReadChunkSize = UInt32(16*1024)
-public let ZipWriteChunkSize = ZipReadChunkSize
-/// The default permissions for newly added entries.
-public let ZipEntryDefaultFilePermissions = UInt16(0o644)
-public let ZipEntryDefaultDirectoryPermissions = UInt16(0o755)
-let ZipPOSIXBufferSize = ZipReadChunkSize
-let ZipDirectoryUnitCount = Int64(1)
-let ZipMinDirectoryEndOffset = 22
-let ZipMaxDirectoryEndOffset = 66000
-let ZipEndOfCentralDirectoryStructSignature = 0x06054b50
-let ZipLocalFileHeaderStructSignature = 0x04034b50
-let ZipDataDescriptorStructSignature = 0x08074b50
-let ZipCentralDirectoryStructSignature = 0x02014b50
 
 /// A custom handler that consumes data containing partial entry data.
 /// - Parameters:
@@ -34,21 +11,6 @@ public typealias ZipDataConsumer = (_ data: Data) throws -> Void
 ///   - size: The size of the chunk to provide.
 /// - Returns: A chunk of `Data`.
 public typealias ZipDataProvider = (_ position: Int, _ size: Int) throws -> Data
-
-public enum ZipArchiveLevel: UInt16 {
-	/// Indicates that an `Entry` has no compression applied to its contents.
-	case store = 0
-	/// Indicates that contents of an `Entry` have been compressed with a zlib compatible Deflate algorithm.
-	case deflate = 8
-}
-
-public struct ZipErrorSource {
-	/// Thrown when an `Entry` can't be stored in the archive with the proposed compression method.
-	public static let invalidArchiveLevel = AttributedError.Source("zipInvalidArchiveLevel")
-	
-	/// Thrown when the start of the central directory exceeds `UINT32_MAX`
-	public static let invalidStartOfCentralDirectoryOffset = AttributedError.Source("zipInvalidStartOfCentralDirectoryOffset")
-}
 
 /// A sequence of uncompressed or compressed ZIP entries.
 ///
@@ -75,14 +37,22 @@ public struct ZipErrorSource {
 ///     let archive = try ZipArchive(url: URL(fileURLWithPath: "/path/file.zip"), for: .update)
 ///     try archive.addEntry("test.txt", relativeTo: baseURL, compressionMethod: .deflate)
 public final class ZipArchive: Sequence {
-	
+
 	/// The access mode for an `Archive`.
 	public enum AccessMode: UInt {
 		case create, read, update
 	}
-	
+
+	public enum Level: UInt16 {
+		/// Indicates that an `Entry` has no compression applied to its contents.
+		case store = 0
+
+		/// Indicates that contents of an `Entry` have been compressed with a zlib compatible Deflate algorithm.
+		case deflate = 8
+	}
+
 	struct EndOfCentralDirectoryRecord: DataSerializable {
-		let endOfCentralDirectorySignature = UInt32(ZipEndOfCentralDirectoryStructSignature)
+		let endOfCentralDirectorySignature = UInt32(endOfCentralDirectoryStructSignature)
 		let numberOfDisk: UInt16
 		let numberOfDiskStart: UInt16
 		let totalNumberOfEntriesOnDisk: UInt16
@@ -96,7 +66,7 @@ public final class ZipArchive: Sequence {
 	}
 	
 	/// URL of an Archive's backing file.
-	public let url: URL
+	public let path: URL
 	
 	/// Access mode for an archive file.
 	public let accessMode: AccessMode
@@ -110,27 +80,27 @@ public final class ZipArchive: Sequence {
 	///     - The file URL _must_ point to an existing file for `.read` or `.update`
 	///     - The file URL _must_ point to a non-existing file for `.write`
 	///   - mode: Access mode.
-	public init(url: URL, for mode: AccessMode) throws {
-		self.url = url
+	public init(path: URL, mode: AccessMode) throws {
+		self.path = path
 		accessMode = mode
 		let fileManager = FileManager()
 		switch mode {
 		case .read:
-			guard fileManager.fileExists(atPath: url.path) else {
-				throw AttributedError(.fileNotFound)
+			guard fileManager.fileExists(atPath: path.path) else {
+				throw ZipError(.fileNotFound)
 			}
-			guard fileManager.isReadableFile(atPath: url.path) else {
-				throw AttributedError(.fileNotReadable)
+			guard fileManager.isReadableFile(atPath: path.path) else {
+				throw ZipError(.fileNotAccessable)
 			}
-			let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: url.path)
+			let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: path.path)
 			archiveFile = fopen(fileSystemRepresentation, "rb")
 			guard let record = ZipArchive.scanForEndOfCentralDirectoryRecord(in: archiveFile) else {
-				throw AttributedError(.invalidFormat)
+				throw ZipError(.invalidFormat)
 			}
 			endOfCentralDirectoryRecord = record
 		case .create:
-			guard !fileManager.fileExists(atPath: url.path) else {
-				throw AttributedError(.fileDidExists)
+			guard !fileManager.fileExists(atPath: path.path) else {
+				throw ZipError(.fileNotAccessable, userInfo: [NSFilePathErrorKey: path.path])
 			}
 			let record = EndOfCentralDirectoryRecord(
 				numberOfDisk: 0, numberOfDiskStart: 0,
@@ -140,23 +110,23 @@ public final class ZipArchive: Sequence {
 				offsetToStartOfCentralDirectory: 0,
 				zipFileCommentLength: 0,
 				zipFileCommentData: Data())
-			guard fileManager.createFile(atPath: url.path, contents: record.data, attributes: nil) else {
-				throw AttributedError(.fileNotWritable)
+			guard fileManager.createFile(atPath: path.path, contents: record.data, attributes: nil) else {
+				throw ZipError(.fileNotAccessable, userInfo: [NSFilePathErrorKey: path.path])
 			}
 			fallthrough
 		case .update:
-			guard fileManager.isWritableFile(atPath: url.path) else {
-				throw AttributedError(.fileNotWritable)
+			guard fileManager.isWritableFile(atPath: path.path) else {
+				throw ZipError(.fileNotAccessable, userInfo: [NSFilePathErrorKey: path.path])
 			}
-			let representation = fileManager.fileSystemRepresentation(withPath: url.path)
+			let representation = fileManager.fileSystemRepresentation(withPath: path.path)
 			archiveFile = fopen(representation, "rb+")
 			guard let record = ZipArchive.scanForEndOfCentralDirectoryRecord(in: archiveFile) else {
-				throw AttributedError(.invalidFormat)
+				throw ZipError(.invalidFormat, userInfo: [NSFilePathErrorKey: path.path])
 			}
 			endOfCentralDirectoryRecord = record
 			fseek(archiveFile, 0, SEEK_SET)
 		}
-		setvbuf(archiveFile, nil, _IOFBF, Int(ZipPOSIXBufferSize))
+		setvbuf(archiveFile, nil, _IOFBF, Int(GZip.chunkSize))
 	}
 	
 	deinit {
@@ -169,17 +139,17 @@ public final class ZipArchive: Sequence {
 		var index = 0
 		return AnyIterator {
 			guard index < Int(record.totalNumberOfEntriesInCentralDirectory) else {return nil}
-			guard let structure: ZipEntry.CentralDirectoryStructure = Data.readStruct(from: self.archiveFile, at: directoryIndex) else {return nil}
+			guard let structure: ZipEntry.CentralDirectoryStructure = GZip.readStruct(from: self.archiveFile, at: directoryIndex) else {return nil}
 			let offset = Int(structure.relativeOffsetOfLocalHeader)
-			guard let header: ZipEntry.LocalFileHeader = Data.readStruct(from: self.archiveFile, at: offset) else {return nil}
+			guard let header: ZipEntry.LocalFileHeader = GZip.readStruct(from: self.archiveFile, at: offset) else {return nil}
 			var descriptor: ZipEntry.DataDescriptor? = nil
 			if structure.usesDataDescriptor {
-				let dataSize = structure.compressionMethod != ZipArchiveLevel.store.rawValue ? structure.compressedSize : structure.uncompressedSize
+				let dataSize = structure.compressionMethod != Level.store.rawValue ? structure.compressedSize : structure.uncompressedSize
 				let position = offset
 					+ ZipEntry.LocalFileHeader.size
 					+ Int(header.fileNameLength + header.extraFieldLength)
 					+ Int(dataSize)
-				descriptor = Data.readStruct(from: self.archiveFile, at: position)
+				descriptor = GZip.readStruct(from: self.archiveFile, at: position)
 			}
 			defer {
 				directoryIndex += ZipEntry.CentralDirectoryStructure.size + Int(structure.fileNameLength + structure.extraFieldLength + structure.fileCommentLength)
@@ -207,22 +177,30 @@ public final class ZipArchive: Sequence {
 	
 	private static func scanForEndOfCentralDirectoryRecord(in file: UnsafeMutablePointer<FILE>) -> EndOfCentralDirectoryRecord? {
 		var directoryEnd = 0
-		var index = ZipMinDirectoryEndOffset
+		var index = Self.minDirectoryEndOffset
 		var fileStat = stat()
 		fstat(fileno(file), &fileStat)
 		let archiveLength = Int(fileStat.st_size)
-		while directoryEnd == 0 && index < ZipMaxDirectoryEndOffset && index <= archiveLength {
+		while directoryEnd == 0 && index < Self.maxDirectoryEndOffset && index <= archiveLength {
 			fseek(file, archiveLength - index, SEEK_SET)
 			var potentialDirectoryEndTag: UInt32 = UInt32()
 			fread(&potentialDirectoryEndTag, 1, MemoryLayout<UInt32>.size, file)
-			if potentialDirectoryEndTag == UInt32(ZipEndOfCentralDirectoryStructSignature) {
+			if potentialDirectoryEndTag == UInt32(Self.endOfCentralDirectoryStructSignature) {
 				directoryEnd = archiveLength - index
-				return Data.readStruct(from: file, at: directoryEnd)
+				return GZip.readStruct(from: file, at: directoryEnd)
 			}
 			index += 1
 		}
 		return nil
 	}
+
+	static let directoryUnitCount = Int64(1)
+	static let minDirectoryEndOffset = 22
+	static let maxDirectoryEndOffset = 66000
+	static let endOfCentralDirectoryStructSignature = 0x06054b50
+	static let localFileHeaderStructSignature = 0x04034b50
+	static let dataDescriptorStructSignature = 0x08074b50
+	static let centralDirectoryStructSignature = 0x02014b50
 }
 
 extension ZipArchive {
@@ -247,7 +225,7 @@ extension ZipArchive {
 		case .file, .symlink:
 			return Int64(entry.uncompressedSize)
 		case .directory:
-			return ZipDirectoryUnitCount
+			return Self.directoryUnitCount
 		}
 	}
 	
@@ -261,12 +239,12 @@ extension ZipArchive {
 	public func totalUnitCount(addingItem url: URL) -> Int64 {
 		let fileManager = FileManager()
 		do {
-			let type = try ZipArchive.typeForItem(at: url, with: fileManager)
+			let type = try ZipArchive.typeForItem(path: url, with: fileManager)
 			switch type {
 			case .file, .symlink:
 				return Int64(try fileManager.fileSizeForItem(at: url))
 			case .directory:
-				return ZipDirectoryUnitCount
+				return Self.directoryUnitCount
 			}
 		} catch {
 			return -1
@@ -298,14 +276,14 @@ extension ZipArchive.EndOfCentralDirectoryRecord {
 	
 	init?(data: Data, additionalDataProvider provider: (Int) throws -> Data) {
 		guard data.count == ZipArchive.EndOfCentralDirectoryRecord.size else {return nil}
-		guard data.scanValue(start: 0) == endOfCentralDirectorySignature else {return nil}
-		numberOfDisk = data.scanValue(start: 4)
-		numberOfDiskStart = data.scanValue(start: 6)
-		totalNumberOfEntriesOnDisk = data.scanValue(start: 8)
-		totalNumberOfEntriesInCentralDirectory = data.scanValue(start: 10)
-		sizeOfCentralDirectory = data.scanValue(start: 12)
-		offsetToStartOfCentralDirectory = data.scanValue(start: 16)
-		zipFileCommentLength = data.scanValue(start: 20)
+		guard GZip.scanValue(data, start: 0) == endOfCentralDirectorySignature else {return nil}
+		numberOfDisk = GZip.scanValue(data, start: 4)
+		numberOfDiskStart = GZip.scanValue(data, start: 6)
+		totalNumberOfEntriesOnDisk = GZip.scanValue(data, start: 8)
+		totalNumberOfEntriesInCentralDirectory = GZip.scanValue(data, start: 10)
+		sizeOfCentralDirectory = GZip.scanValue(data, start: 12)
+		offsetToStartOfCentralDirectory = GZip.scanValue(data, start: 16)
+		zipFileCommentLength = GZip.scanValue(data, start: 20)
 		guard let commentData = try? provider(Int(zipFileCommentLength)) else {return nil}
 		guard commentData.count == Int(zipFileCommentLength) else {return nil}
 		zipFileCommentData = commentData

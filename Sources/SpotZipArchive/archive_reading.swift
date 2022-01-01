@@ -1,59 +1,55 @@
-//
-//  ZipArchive+Reading.swift
-//  Spot
-//
-//  Created by Shawn Clovie on 7/16/2018.
-//  Copyright © 2018 Shawn Clovie. All rights reserved.
-//
-
 import Foundation
-import Spot
 
 extension ZipArchive {
     /// Read a ZIP `Entry` from the receiver and write it to `url`.
     ///
     /// - Parameters:
     ///   - entry: The ZIP `Entry` to read.
-    ///   - url: The destination file URL.
+    ///   - targetPath: The destination file URL.
     ///   - bufferSize: The maximum size of the read buffer and the decompression buffer (if needed).
     ///   - progress: A progress object that can be used to track or cancel the extract operation.
     /// - Returns: The checksum of the processed content.
     /// - Throws: An error if the destination file cannot be written or the entry contains malformed content.
 	@discardableResult
-    public func extract(_ entry: ZipEntry, to url: URL,
-						bufferSize: UInt32 = ZipReadChunkSize,
-                        progress: Progress? = nil) throws -> CRC32 {
+    public func extract(_ entry: ZipEntry,
+						targetPath: URL,
+						bufferSize: UInt32 = GZip.chunkSize,
+						progress: Progress? = nil) throws -> GZip.CRC32 {
         let fileManager = FileManager()
-		let checksum: CRC32
+		let checksum: GZip.CRC32
         switch entry.type {
         case .file:
-            guard !fileManager.fileExists(atPath: url.path) else {
-                throw AttributedError(.fileDidExists, userInfo: [NSFilePathErrorKey: url.path])
+            guard !fileManager.fileExists(atPath: targetPath.path) else {
+                throw ZipError(.fileNotAccessable, "file_did_exists", userInfo: [NSFilePathErrorKey: targetPath.path])
             }
-			try fileManager.createDirectoryIfNotExists(for: url.deletingLastPathComponent())
-            let representation = fileManager.fileSystemRepresentation(withPath: url.path)
+			if !fileManager.fileExists(atPath: targetPath.path) {
+				try fileManager.createDirectory(at: targetPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+			}
+            let representation = fileManager.fileSystemRepresentation(withPath: targetPath.path)
             let destFile: UnsafeMutablePointer<FILE> = fopen(representation, "wb+")
             defer {
 				fclose(destFile)
 			}
 			checksum = try extract(entry, bufferSize: bufferSize, progress: progress) {
-				_ = try $0.write(to: destFile)
+				_ = try GZip.write($0, to: destFile)
 			}
         case .directory:
 			checksum = try extract(entry, bufferSize: bufferSize, progress: progress) { (_: Data) in
-				try fileManager.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
+				try fileManager.createDirectory(at: targetPath, withIntermediateDirectories: true, attributes: nil)
 			}
         case .symlink:
-            guard !fileManager.fileExists(atPath: url.path) else {
-                throw AttributedError(.fileDidExists, userInfo: [NSFilePathErrorKey: url.path])
+            guard !fileManager.fileExists(atPath: targetPath.path) else {
+                throw ZipError(.fileNotAccessable, "file_did_exists", userInfo: [NSFilePathErrorKey: targetPath.path])
             }
 			checksum = try extract(entry, bufferSize: bufferSize, progress: progress) { (data) in
-				try fileManager.createDirectoryIfNotExists(for: url.deletingLastPathComponent())
+				if !fileManager.fileExists(atPath: targetPath.path) {
+					try fileManager.createDirectory(at: targetPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+				}
 				let linkPath = String(decoding: data, as: UTF8.self)
-				try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: linkPath)
+				try fileManager.createSymbolicLink(atPath: targetPath.path, withDestinationPath: linkPath)
 			}
         }
-        try fileManager.setAttributes(entry.fileAttributes, ofItemAtPath: url.path)
+        try fileManager.setAttributes(entry.fileAttributes, ofItemAtPath: targetPath.path)
         return checksum
     }
 
@@ -67,16 +63,16 @@ extension ZipArchive {
     /// - Returns: The checksum of the processed content.
     /// - Throws: An error if the destination file cannot be written or the entry contains malformed content.
     public func extract(_ entry: ZipEntry,
-						bufferSize: UInt32 = ZipReadChunkSize,
+						bufferSize: UInt32 = GZip.chunkSize,
                         progress: Progress? = nil,
-						consumer: ZipDataConsumer) throws -> CRC32 {
-		let checksum: CRC32
+						consumer: ZipDataConsumer) throws -> GZip.CRC32 {
+		let checksum: GZip.CRC32
         fseek(archiveFile, entry.dataOffset, SEEK_SET)
 		progress?.totalUnitCount = totalUnitCount(reading: entry)
         switch entry.type {
         case .file:
-            guard let method = ZipArchiveLevel(rawValue: entry.localFileHeader.compressionMethod) else {
-                throw AttributedError(ZipErrorSource.invalidArchiveLevel)
+            guard let method = Level(rawValue: entry.localFileHeader.compressionMethod) else {
+				throw ZipError(.invalidArchiveLevel, userInfo: ["compression_method": entry.localFileHeader.compressionMethod])
             }
             switch method {
             case .store:
@@ -90,8 +86,8 @@ extension ZipArchive {
             progress?.completedUnitCount = totalUnitCount(reading: entry)
         case .symlink:
             let size = Int(entry.localFileHeader.compressedSize)
-            let data = try Data.readChunk(of: size, from: archiveFile)
-            checksum = data.crc32(checksum: 0)
+			let data = try GZip.readChunk(of: size, from: archiveFile)
+			checksum = GZip.crc32(data, checksum: 0)
             try consumer(data)
             progress?.completedUnitCount = totalUnitCount(reading: entry)
         }
@@ -100,15 +96,16 @@ extension ZipArchive {
 
     // MARK: - Helpers
 
-    private func readUncompressed(entry: ZipEntry, bufferSize: UInt32,
+    private func readUncompressed(entry: ZipEntry,
+								  bufferSize: UInt32,
                                   progress: Progress? = nil,
-								  with consumer: ZipDataConsumer) throws -> CRC32 {
+								  with consumer: ZipDataConsumer) throws -> GZip.CRC32 {
         let size = Int(entry.centralDirectoryStructure.uncompressedSize)
-        return try Data.consumePart(of: size, chunkSize: Int(bufferSize), provider: { (_, chunkSize) in
+		return try GZip.consumePart(of: size, chunkSize: Int(bufferSize), provider: { (_, chunkSize) in
             if progress?.isCancelled == true {
-				throw AttributedError(.cancelled)
+				throw ZipError(.cancelled)
 			}
-            return try Data.readChunk(of: Int(chunkSize), from: self.archiveFile)
+			return try GZip.readChunk(of: Int(chunkSize), from: self.archiveFile)
         }, consumer: { (data) in
             try consumer(data)
             progress?.completedUnitCount += Int64(data.count)
@@ -117,15 +114,15 @@ extension ZipArchive {
 
     private func readCompressed(entry: ZipEntry, bufferSize: UInt32,
                                 progress: Progress? = nil,
-								with consumer: ZipDataConsumer) throws -> CRC32 {
+								with consumer: ZipDataConsumer) throws -> GZip.CRC32 {
         let size = Int(entry.centralDirectoryStructure.compressedSize)
 		if progress?.isCancelled == true {
-			throw AttributedError(.cancelled)
+			throw ZipError(.cancelled)
 		}
-		let result = try Data.readChunk(of: Int(size), from: archiveFile)
-			.spot.inflated()
+		let rawData = try GZip.readChunk(of: Int(size), from: archiveFile)
+		let result = try GZip.inflated(rawData)
 		try consumer(result)
 		progress?.completedUnitCount += Int64(result.count)
-		return result.crc32(checksum: 0)
+		return GZip.crc32(result, checksum: 0)
     }
 }

@@ -1,13 +1,4 @@
-//
-//  Archive+Writing.swift
-//  Spot
-//
-//  Created by Shawn Clovie on 7/16/2018.
-//  Copyright © 2018 Shawn Clovie. All rights reserved.
-//
-
 import Foundation
-import Spot
 
 extension ZipArchive {
 	private enum ModifyOperation {
@@ -32,18 +23,18 @@ extension ZipArchive {
 	/// - Throws: An error if the source file cannot be read or the receiver is not writable.
 	public func addEntry(at path: URL,
 						 entryPath: String = "",
-						 by level: ZipArchiveLevel = .store,
-						 bufferSize: UInt32 = ZipWriteChunkSize,
+						 by level: Level = .store,
+						 bufferSize: UInt32 = GZip.chunkSize,
 						 progress: Progress? = nil) throws {
 		let fileManager = FileManager()
 		guard fileManager.fileExists(atPath: path.path) else {
-			throw AttributedError(.fileNotFound)
+			throw ZipError(.fileNotFound)
 		}
 		guard fileManager.isReadableFile(atPath: path.path) else {
-			throw AttributedError(AttributedError.Source.privilegeLimited)
+			throw ZipError(.fileNotAccessable)
 		}
 		let entryPath = entryPath.isEmpty ? path.lastPathComponent : entryPath
-		let type = try ZipArchive.typeForItem(at: path, with: fileManager)
+		let type = try Self.typeForItem(path: path, with: fileManager)
 		let modDate = try fileManager.fileModificationDateTimeForItem(at: path)
 		let uncompressedSize = type == .directory ? 0 : try fileManager.fileSizeForItem(at: path)
 		let permissions = try fileManager.permissionsForItem(at: path)
@@ -51,41 +42,43 @@ extension ZipArchive {
 		switch type {
 		case .file:
 			let entryFileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: path.path)
-			let entryFile: UnsafeMutablePointer<FILE> = fopen(entryFileSystemRepresentation, "rb")
+			let entryFile = fopen(entryFileSystemRepresentation, "rb")!
 			defer {
 				fclose(entryFile)
 			}
-			provider = { _, _ in try Data.readChunk(of: Int(bufferSize), from: entryFile)}
-			try self.addEntry(with: entryPath, type: type,
-							  uncompressedSize: uncompressedSize,
-							  modificationDate: modDate,
-							  permissions: permissions,
-							  by: level, bufferSize: bufferSize,
-							  progress: progress, provider: provider)
-		case .directory:
-			provider = { _, _ in Data()}
-			try self.addEntry(with: entryPath.hasSuffix("/") ? entryPath : entryPath + "/",
-							  type: type, uncompressedSize: uncompressedSize,
-							  modificationDate: modDate, permissions: permissions,
-							  by: level,
-							  bufferSize: bufferSize,
-							  progress: progress, provider: provider)
-		case .symlink:
-			provider = { _, _ -> Data in
-				let fileManager = FileManager()
-				let linkDestination = try fileManager.destinationOfSymbolicLink(atPath: path.path)
-				let linkFileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: linkDestination)
-				let linkLength = Int(strlen(linkFileSystemRepresentation))
-				let linkBuffer = UnsafeBufferPointer(start: linkFileSystemRepresentation, count: linkLength)
-				return Data.init(buffer: linkBuffer)
+			provider = { (_, _) in
+				try GZip.readChunk(of: Int(bufferSize), from: entryFile)
 			}
-			try self.addEntry(with: entryPath, type: type,
-							  uncompressedSize: uncompressedSize,
-							  modificationDate: modDate,
-							  permissions: permissions,
-							  by: level,
-							  bufferSize: bufferSize,
-							  progress: progress, provider: provider)
+			try addEntry(with: entryPath, type: type,
+						 uncompressedSize: uncompressedSize,
+						 modificationDate: modDate,
+						 permissions: permissions,
+						 by: level, bufferSize: bufferSize,
+						 progress: progress, provider: provider)
+		case .directory:
+			provider = { (_, _) in Data() }
+			try addEntry(with: entryPath.hasSuffix("/") ? entryPath : entryPath + "/",
+						 type: type, uncompressedSize: uncompressedSize,
+						 modificationDate: modDate, permissions: permissions,
+						 by: level,
+						 bufferSize: bufferSize,
+						 progress: progress, provider: provider)
+		case .symlink:
+			provider = { (_, _) in
+				let fileManager = FileManager()
+				let destination = try fileManager.destinationOfSymbolicLink(atPath: path.path)
+				let fsRepresentation = fileManager.fileSystemRepresentation(withPath: destination)
+				let length = strlen(fsRepresentation)
+				let buffer = UnsafeBufferPointer(start: fsRepresentation, count: length)
+				return Data(buffer: buffer)
+			}
+			try addEntry(with: entryPath, type: type,
+						 uncompressedSize: uncompressedSize,
+						 modificationDate: modDate,
+						 permissions: permissions,
+						 by: level,
+						 bufferSize: bufferSize,
+						 progress: progress, provider: provider)
 		}
 	}
 
@@ -109,18 +102,18 @@ extension ZipArchive {
 						 uncompressedSize: UInt32,
 						 modificationDate: Date = Date(),
 						 permissions: UInt16? = nil,
-						 by level: ZipArchiveLevel = .store,
-						 bufferSize: UInt32 = ZipWriteChunkSize,
+						 by level: Level = .store,
+						 bufferSize: UInt32 = GZip.chunkSize,
 						 progress: Progress? = nil,
 						 provider: ZipDataProvider) throws {
 		guard accessMode != .read else {
-			throw AttributedError(.fileNotWritable)
+			throw ZipError(.fileNotAccessable, "file_not_writable")
 		}
-		progress?.totalUnitCount = type == .directory ? ZipDirectoryUnitCount : Int64(uncompressedSize)
+		progress?.totalUnitCount = type == .directory ? Self.directoryUnitCount : Int64(uncompressedSize)
 		let endOfCentralDirRecord = endOfCentralDirectoryRecord
 		let startOfCD = Int(endOfCentralDirRecord.offsetToStartOfCentralDirectory)
 		fseek(archiveFile, startOfCD, SEEK_SET)
-		let existingCentralDirData = try Data.readChunk(of: Int(endOfCentralDirRecord.sizeOfCentralDirectory), from: archiveFile)
+		let existingCentralDirData = try GZip.readChunk(of: Int(endOfCentralDirRecord.sizeOfCentralDirectory), from: archiveFile)
 		fseek(archiveFile, startOfCD, SEEK_SET)
 		let localFileHeaderStart = ftell(archiveFile)
 		defer {
@@ -135,17 +128,19 @@ extension ZipArchive {
 			// Write the local file header a second time. Now with compressedSize (if applicable) and a valid checksum.
 			let headerLast = try writeLocalFileHeader(path: path, by: level, size: (uncompressedSize, written), checksum: checksum, modification: modificationDate, fileManager: fileManager)
 			fseek(archiveFile, startOfCD, SEEK_SET)
-			_ = try existingCentralDirData.write(to: archiveFile)
+			_ = try GZip.write(existingCentralDirData, to: archiveFile)
 			let permissions = permissions
-				?? (type == .directory ? ZipEntryDefaultDirectoryPermissions : ZipEntryDefaultFilePermissions)
+				?? (type == .directory
+					? ZipEntry.defaultDirectoryPermissions
+					: ZipEntry.defaultFilePermissions)
 			let externalAttributes = type.entryExternalFileAttributes(permissions: permissions)
 			let centralDir = try writeCentralDirectoryStructure(headerLast, relativeOffset: UInt32(localFileHeaderStart), externalFileAttributes: externalAttributes)
 			if startOfCD > UINT32_MAX {
-				throw AttributedError(ZipErrorSource.invalidStartOfCentralDirectoryOffset)
+				throw ZipError(.invalidStartOfCentralDirectoryOffset)
 			}
 			endOfCentralDirectoryRecord = try writeEndOfCentralDirectory(centralDir, startOfCentralDirectory: UInt32(startOfCD), .add)
-		} catch let err as AttributedError {
-			if err.source == .cancelled {
+		} catch let err as ZipError {
+			if err.reason == .cancelled {
 				try rollback(localFileHeaderStart, existingCentralDirData, endOfCentralDirRecord)
 			}
 			throw err
@@ -160,11 +155,12 @@ extension ZipArchive {
 	///   - progress: A progress object that can be used to track or cancel the remove operation.
 	/// - Throws: An error if the `Entry` is malformed or the receiver is not writable.
 	public func remove(_ entry: ZipEntry,
-					   bufferSize: UInt32 = ZipReadChunkSize,
+					   bufferSize: UInt32 = UInt32(GZip.chunkSize),
 					   progress: Progress? = nil) throws {
 		let uniqueString = ProcessInfo.processInfo.globallyUniqueString
-		let tempArchiveURL =  URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(uniqueString)
-		let archive = try ZipArchive(url: tempArchiveURL, for: .create)
+		let tempArchiveURL =  URL(fileURLWithPath: NSTemporaryDirectory())
+			.appendingPathComponent(uniqueString)
+		let archive = try ZipArchive(path: tempArchiveURL, mode: .create)
 		progress?.totalUnitCount = totalUnitCount(removing: entry)
 		var centralDirectoryData = Data()
 		var offset = 0
@@ -173,13 +169,13 @@ extension ZipArchive {
 			if curEntry != entry {
 				let entryStart = Int(curEntry.centralDirectoryStructure.relativeOffsetOfLocalHeader)
 				fseek(archiveFile, entryStart, SEEK_SET)
-				_ = try Data.consumePart(of: Int(curEntry.localSize), chunkSize: Int(bufferSize), provider: { (_, chunkSize) in
+				try GZip.consumePart(of: curEntry.localSize, chunkSize: Int(bufferSize), provider: { (_, chunkSize) in
 					if progress?.isCancelled == true {
-						throw AttributedError(.cancelled)
+						throw ZipError(.cancelled)
 					}
-					return try Data.readChunk(of: Int(chunkSize), from: archiveFile)
+					return try GZip.readChunk(of: Int(chunkSize), from: archiveFile)
 				}, consumer: {
-					_ = try $0.write(to: archive.archiveFile)
+					try GZip.write($0, to: archive.archiveFile)
 					progress?.completedUnitCount += Int64($0.count)
 				})
 				let offsetStructure = ZipEntry.CentralDirectoryStructure(from: curStructure, offset: UInt32(offset))
@@ -189,23 +185,25 @@ extension ZipArchive {
 			}
 		}
 		let startOfCentralDirectory = ftell(archive.archiveFile)
-		_ = try centralDirectoryData.write(to: archive.archiveFile)
+		_ = try GZip.write(centralDirectoryData, to: archive.archiveFile)
 		archive.endOfCentralDirectoryRecord = endOfCentralDirectoryRecord
 		let record = try archive.writeEndOfCentralDirectory(entry.centralDirectoryStructure, startOfCentralDirectory: UInt32(startOfCentralDirectory), .remove)
 		archive.endOfCentralDirectoryRecord = record
 		endOfCentralDirectoryRecord = record
 		fflush(archive.archiveFile)
-		try replaceCurrentArchiveWithArchive(at: archive.url)
+		try replaceCurrentArchiveWithArchive(at: archive.path)
 	}
 
 	// MARK: - Helpers
 
-	private func writeLocalFileHeader(path: String,
-									  by level: ZipArchiveLevel,
-									  size: (uncompressed: UInt32, compressed: UInt32),
-									  checksum: CRC32,
-									  modification: Date,
-									  fileManager: FileManager = .init()) throws -> ZipEntry.LocalFileHeader {
+	private func writeLocalFileHeader(
+		path: String,
+		by level: Level,
+		size: (uncompressed: UInt32, compressed: UInt32),
+		checksum: GZip.CRC32,
+		modification: Date,
+		fileManager: FileManager = .init()) throws -> ZipEntry.LocalFileHeader
+	{
 		let fsRepresentation = fileManager.fileSystemRepresentation(withPath: path)
 		let nameLen = strlen(fsRepresentation)
 		let nameBuf = UnsafeBufferPointer(start: fsRepresentation, count: nameLen)
@@ -222,16 +220,18 @@ extension ZipArchive {
 			extraFieldLength: UInt16(0),
 			fileNameData: Data(buffer: nameBuf),
 			extraFieldData: Data())
-		_ = try header.data.write(to: archiveFile)
+		_ = try GZip.write(header.data, to: archiveFile)
 		return header
 	}
 
-	private func writeEntry(_ header: ZipEntry.LocalFileHeader,
-							of type: ZipEntry.EntryType,
-							by level: ZipArchiveLevel,
-							bufferSize: UInt32, progress: Progress? = nil,
-							provider: ZipDataProvider) throws -> (sizeWritten: UInt32, crc32: CRC32) {
-		var checksum = CRC32(0)
+	private func writeEntry(
+		_ header: ZipEntry.LocalFileHeader,
+		of type: ZipEntry.EntryType,
+		by level: Level,
+		bufferSize: UInt32, progress: Progress? = nil,
+		provider: ZipDataProvider) throws -> (sizeWritten: UInt32, crc32: GZip.CRC32)
+	{
+		var checksum = GZip.CRC32(0)
 		var sizeWritten = UInt32(0)
 		switch type {
 		case .file:
@@ -255,53 +255,63 @@ extension ZipArchive {
 		return (sizeWritten, checksum)
 	}
 
-	private func writeUncompressed(size: UInt32,
-								   bufferSize: UInt32,
-								   progress: Progress? = nil,
-								   provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: CRC32) {
+	private func writeUncompressed(
+		size: UInt32,
+		bufferSize: UInt32,
+		progress: Progress? = nil,
+		provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: GZip.CRC32)
+	{
 		var position = 0
 		var sizeWritten = 0
-		var checksum = CRC32(0)
+		var checksum = GZip.CRC32(0)
 		while position < size {
 			if progress?.isCancelled == true {
-				throw AttributedError(.cancelled)
+				throw ZipError(.cancelled)
 			}
 			let readSize = (Int(size) - position) >= bufferSize ? Int(bufferSize) : (Int(size) - position)
 			let entryChunk = try provider(Int(position), Int(readSize))
-			checksum = entryChunk.crc32(checksum: checksum)
-			sizeWritten += try entryChunk.write(to: archiveFile)
+			checksum = GZip.crc32(entryChunk, checksum: checksum)
+			sizeWritten += try GZip.write(entryChunk, to: archiveFile)
 			position += Int(bufferSize)
 			progress?.completedUnitCount = Int64(sizeWritten)
 		}
 		return (UInt32(sizeWritten), checksum)
 	}
 
-	private func writeCompressed(size: UInt32,
-								 bufferSize: UInt32,
-								 progress: Progress? = nil,
-								 provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: CRC32) {
-		let data = try provider(0, Int(size))
-			.spot.deflated()
-		let written = try data.write(to: archiveFile)
-		return (UInt32(written), data.crc32(checksum: 0))
+	private func writeCompressed(
+		size: UInt32,
+		bufferSize: UInt32,
+		progress: Progress? = nil,
+		provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: GZip.CRC32)
+	{
+		var data = try provider(0, Int(size))
+		data = try GZip.deflated(data, level: .default)
+		let written = try GZip.write(data, to: archiveFile)
+		return (UInt32(written), GZip.crc32(data, checksum: 0))
 	}
 
-	private func writeSymbolicLink(size: UInt32, provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: CRC32) {
+	private func writeSymbolicLink(size: UInt32, provider: ZipDataProvider) throws -> (sizeWritten: UInt32, checksum: GZip.CRC32) {
 		let linkData = try provider(0, Int(size))
-		let checksum = linkData.crc32(checksum: 0)
-		let sizeWritten = try linkData.write(to: archiveFile)
+		let checksum = GZip.crc32(linkData, checksum: 0)
+		let sizeWritten = try GZip.write(linkData, to: archiveFile)
 		return (UInt32(sizeWritten), checksum)
 	}
 
-	private func writeCentralDirectoryStructure(_ header: ZipEntry.LocalFileHeader, relativeOffset: UInt32, externalFileAttributes: UInt32) throws -> ZipEntry.CentralDirectoryStructure {
+	private func writeCentralDirectoryStructure(
+		_ header: ZipEntry.LocalFileHeader,
+		relativeOffset: UInt32,
+		externalFileAttributes: UInt32) throws -> ZipEntry.CentralDirectoryStructure
+	{
 		let structure = ZipEntry.CentralDirectoryStructure(from: header, fileAttributes: externalFileAttributes, relativeOffset: relativeOffset)
-		_ = try structure.data.write(to: archiveFile)
+		_ = try GZip.write(structure.data, to: archiveFile)
 		return structure
 	}
 
-	private func writeEndOfCentralDirectory(_ structure: ZipEntry.CentralDirectoryStructure,
-											startOfCentralDirectory: UInt32,
-											_ operation: ModifyOperation) throws -> EndOfCentralDirectoryRecord {
+	private func writeEndOfCentralDirectory(
+		_ structure: ZipEntry.CentralDirectoryStructure,
+		startOfCentralDirectory: UInt32,
+		_ operation: ModifyOperation) throws -> EndOfCentralDirectoryRecord
+	{
 		var record = endOfCentralDirectoryRecord
 		let countChange = operation.changeCount
 		let dataLength = structure.extraFieldLength + structure.fileNameLength + structure.fileCommentLength
@@ -312,30 +322,32 @@ extension ZipArchive {
 			numberOfEntriesInCentralDirectory: record.totalNumberOfEntriesInCentralDirectory + UInt16(countChange),
 			updatedSizeOfCentralDirectory: updatedSize,
 			startOfCentralDirectory: startOfCentralDirectory)
-		_ = try record.data.write(to: archiveFile)
+		_ = try GZip.write(record.data, to: archiveFile)
 		return record
 	}
 
-	private func rollback(_ localFileHeaderStart: Int,
-						  _ existingCentralDirectoryData: Data,
-						  _ record: EndOfCentralDirectoryRecord) throws {
+	private func rollback(
+		_ localFileHeaderStart: Int,
+		_ existingCentralDirectoryData: Data,
+		_ record: EndOfCentralDirectoryRecord) throws
+	{
 		fflush(archiveFile)
 		ftruncate(fileno(archiveFile), off_t(localFileHeaderStart))
 		fseek(archiveFile, localFileHeaderStart, SEEK_SET)
-		_ = try existingCentralDirectoryData.write(to: archiveFile)
-		_ = try record.data.write(to: archiveFile)
+		try GZip.write(existingCentralDirectoryData, to: archiveFile)
+		try GZip.write(record.data, to: archiveFile)
 	}
 
-	private func replaceCurrentArchiveWithArchive(at url: URL) throws {
+	private func replaceCurrentArchiveWithArchive(at path: URL) throws {
 		fclose(archiveFile)
 		let fileManager = FileManager()
 		#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
-		_ = try fileManager.replaceItemAt(self.url, withItemAt: url)
+		_ = try fileManager.replaceItemAt(self.path, withItemAt: path)
 		#else
-		_ = try fileManager.removeItem(at: self.url)
-		_ = try fileManager.moveItem(at: url, to: self.url)
+		_ = try fileManager.removeItem(at: self.path)
+		_ = try fileManager.moveItem(at: path, to: self.path)
 		#endif
-		let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: self.url.path)
+		let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: self.path.path)
 		archiveFile = fopen(fileSystemRepresentation, "rb+")
 	}
 }
